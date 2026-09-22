@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -197,7 +198,7 @@ func TestRebaseSuccess(t *testing.T) {
 	g.write("base", "base\n")
 	base := g.commit("base work")
 
-	got, err := rebase(g.r, base, head)
+	got, err := rebase(g.r, base, head, io.Discard)
 	if err != nil {
 		t.Fatalf("rebase() error = %v", err)
 	}
@@ -222,7 +223,7 @@ func TestRebaseNoop(t *testing.T) {
 	g.write("feature", "feature\n")
 	head := g.commit("feature work")
 
-	got, err := rebase(g.r, base, head)
+	got, err := rebase(g.r, base, head, io.Discard)
 	if err != nil {
 		t.Fatalf("rebase() error = %v", err)
 	}
@@ -244,7 +245,7 @@ func TestRebaseConflict(t *testing.T) {
 	g.write("conflict", "base\n")
 	base := g.commit("base edit")
 
-	_, err := rebase(g.r, base, head)
+	_, err := rebase(g.r, base, head, io.Discard)
 	if err == nil {
 		t.Fatal("rebase() succeeded, want a conflict")
 	}
@@ -275,7 +276,7 @@ func TestRebasePreservesMergeTopology(t *testing.T) {
 	g.write("base", "base\n")
 	base := g.commit("base work")
 
-	got, err := rebase(g.r, base, head)
+	got, err := rebase(g.r, base, head, io.Discard)
 	if err != nil {
 		t.Fatalf("rebase() error = %v", err)
 	}

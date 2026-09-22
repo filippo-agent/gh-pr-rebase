@@ -11,6 +11,13 @@ jobs:
         with:
           go-version-file: go.mod
           cache: false
+      - name: Install Mergiraf for integration tests
+        run: |
+          curl --fail --location --retry 3 https://codeberg.org/mergiraf/mergiraf/releases/download/v0.19.1/mergiraf_x86_64-unknown-linux-gnu.tar.gz -o "$RUNNER_TEMP/mergiraf.tar.gz"
+          echo "f8179e1a779a9b50802b96f7244c85bda3990b6411cd92386bf7c1f829e40b42  $RUNNER_TEMP/mergiraf.tar.gz" | sha256sum --check
+          mkdir -p "$RUNNER_TEMP/mergiraf-bin"
+          tar -xzf "$RUNNER_TEMP/mergiraf.tar.gz" -C "$RUNNER_TEMP/mergiraf-bin" mergiraf
+          echo "$RUNNER_TEMP/mergiraf-bin" >> "$GITHUB_PATH"
       - run: go test -race ./...
       - run: go vet ./...
       - run: go build .

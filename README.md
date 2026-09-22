@@ -34,6 +34,24 @@ used as the committer identity. Authors are preserved. Override with
 `--committer-name` and `--committer-email` (recommended for Enterprise instances
 with different email conventions).
 
+## Automatic conflict resolution with Mergiraf
+
+Optionally install [Mergiraf](https://mergiraf.org/installation.html) and put
+`mergiraf` on `PATH` (tested with version 0.19.1). No Git configuration is needed.
+
+The command first tries a normal Git rebase. If it stops with conflicts and
+Mergiraf is available, it aborts that attempt and retries the entire rebase once
+with Mergiraf's merge driver enabled for its supported file patterns. The driver
+and attributes are configured **only in the temporary repository**, not globally
+or in the PR. This also works with `--dry-run`.
+
+If Mergiraf is missing, fails, or leaves any conflicts unresolved, nothing is
+pushed. Non-conflict failures are not retried. Git must complete the entire
+rebase successfully before a push is considered, and the same PR rechecks and
+force-with-lease still apply. Mergiraf's retry output is shown so you can review
+its work; syntax-aware resolution is not a guarantee of semantic correctness.
+Use `--dry-run` first when you want to inspect the result before pushing.
+
 ## Behavior and safety
 
 - The PR must be open, with both repositories still available.
@@ -47,9 +65,10 @@ with different email conventions).
   not a hard-coded `main` branch. Git's usual duplicate/empty-commit behavior
   applies; merge topology is recreated, but old merge resolutions may need to
   be redone and can cause the operation to fail.
-- Conflicts fail without pushing. The temporary repository is removed on exit;
-  resolve complicated rebases manually. `--dry-run` actually performs the local
-  rebase, but never pushes. Already-current branches are left untouched.
+- Unresolved conflicts fail without pushing, even after the optional Mergiraf
+  retry. The temporary repository is removed on exit; resolve complicated
+  rebases manually. `--dry-run` actually performs the local rebase, but never
+  pushes. Already-current branches are left untouched.
 - Rechecks PR state, edit permission, branch names, repositories, and commit
   IDs before pushing. Push uses **an explicit expected-SHA force-with-lease**,
   so a contributor's concurrent push is not overwritten.
@@ -77,3 +96,5 @@ go build .
 ```
 
 Tests use disposable local Git repositories and do not require GitHub access.
+Mergiraf fallback tests use a fake driver; additional integration coverage runs
+when the real `mergiraf` executable is on `PATH`.

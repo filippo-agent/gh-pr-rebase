@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -125,14 +126,73 @@ func getPR(r runner, t target) (pullRequest, error) {
 func samePR(a, b pullRequest) bool {
 	return a.Head.Ref == b.Head.Ref && a.Head.SHA == b.Head.SHA && a.Head.Repo.FullName == b.Head.Repo.FullName && a.Base.Ref == b.Base.Ref && a.Base.SHA == b.Base.SHA && a.Base.Repo.FullName == b.Base.Repo.FullName
 }
-func rebase(r runner, base, head string) (string, error) {
+func rebase(r runner, base, head string, out io.Writer) (string, error) {
 	if _, err := r.command("git", "checkout", "--detach", head); err != nil {
 		return "", err
 	}
-	if _, err := r.command("git", "-c", "commit.gpgSign=false", "rebase", "--rebase-merges", "--no-fork-point", base); err != nil {
-		return "", fmt.Errorf("rebase failed (possibly a conflict); nothing was pushed: %w", err)
+	rebaseArgs := []string{"-c", "commit.gpgSign=false", "rebase", "--rebase-merges", "--no-fork-point", base}
+	if _, err := r.command("git", rebaseArgs...); err != nil {
+		if retryErr := retryWithMergiraf(r, rebaseArgs, out); retryErr != nil {
+			return "", fmt.Errorf("rebase failed; nothing was pushed: %w\nMergiraf fallback: %w", err, retryErr)
+		}
 	}
 	return r.command("git", "rev-parse", "HEAD")
+}
+
+// Retry from the original head using a merge driver, rather than guessing which
+// conflicted files can safely be staged. Git still decides whether every commit
+// (including recreated merges) has been resolved before the rebase can succeed.
+func retryWithMergiraf(r runner, rebaseArgs []string, out io.Writer) error {
+	if err := r.ctx.Err(); err != nil {
+		return err
+	}
+	unmerged, err := r.command("git", "ls-files", "--unmerged")
+	if err != nil {
+		return err
+	}
+	if unmerged == "" {
+		return errors.New("not attempted: no conflicted index entries")
+	}
+	tool, err := exec.LookPath("mergiraf")
+	if err != nil {
+		return fmt.Errorf("install mergiraf on PATH to try automatic conflict resolution: %w", err)
+	}
+	tool, err = filepath.Abs(tool)
+	if err != nil {
+		return err
+	}
+	attributes, err := r.command(tool, "languages", "--gitattributes")
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(attributes) == "" {
+		return errors.New("mergiraf returned no supported file patterns")
+	}
+	if _, err := r.command("git", "rebase", "--abort"); err != nil {
+		return err
+	}
+	// Keep both config and attributes private to the disposable repository. %P
+	// and the temporary paths are shell-quoted by Git when expanding the driver.
+	driver := "'" + strings.ReplaceAll(tool, "'", "'\\''") + "' merge --git %O %A %B -p %P -l %L"
+	for _, kv := range [][2]string{{"merge.mergiraf.driver", driver}, {"merge.conflictStyle", "diff3"}} {
+		if _, err := r.command("git", "config", kv[0], kv[1]); err != nil {
+			return err
+		}
+	}
+	info := filepath.Join(r.dir, ".git", "info")
+	if err := os.MkdirAll(info, 0o700); err != nil {
+		return err
+	}
+	if err := os.WriteFile(filepath.Join(info, "attributes"), []byte(attributes+"\n"), 0o600); err != nil {
+		return err
+	}
+	fmt.Fprintln(out, "Conflicts detected; retrying the rebase with Mergiraf…")
+	result, err := r.command("git", rebaseArgs...)
+	if err != nil {
+		return fmt.Errorf("rebase with Mergiraf did not succeed: %w", err)
+	}
+	fmt.Fprintln(out, result)
+	return nil
 }
 func push(r runner, remote, ref, old, newSHA string) error {
 	_, err := r.command("git", "push", "--force-with-lease=refs/heads/"+ref+":"+old, remote, newSHA+":refs/heads/"+ref)
@@ -151,7 +211,7 @@ func run(ctx context.Context, args []string, out io.Writer) error {
 	name := fs.String("committer-name", "", "committer name (default: authenticated GitHub user's name)")
 	email := fs.String("committer-email", "", "committer email (default: authenticated GitHub user's noreply address)")
 	fs.Usage = func() {
-		fmt.Fprintln(out, "Usage: gh-pr-rebase [flags] https://github.com/OWNER/REPO/pull/NUMBER\n       gh-pr-rebase [flags] 'OWNER/REPO#NUMBER'\n\nRebases onto the current base branch and pushes with an explicit force-with-lease.\nRequires git and authenticated gh. Flags must precede the PR.")
+		fmt.Fprintln(out, "Usage: gh-pr-rebase [flags] https://github.com/OWNER/REPO/pull/NUMBER\n       gh-pr-rebase [flags] 'OWNER/REPO#NUMBER'\n\nRebases onto the current base branch and pushes with an explicit force-with-lease.\nRequires git and authenticated gh. Mergiraf is optional for conflicts. Flags must precede the PR.")
 		fs.PrintDefaults()
 	}
 	if err := fs.Parse(args); err != nil {
@@ -242,7 +302,7 @@ func run(ctx context.Context, args []string, out io.Writer) error {
 		}
 	}
 	fmt.Fprintf(out, "Rebasing %s:%s onto %s:%s…\n", p.Head.Repo.FullName, p.Head.Ref, p.Base.Repo.FullName, p.Base.Ref)
-	newSHA, err := rebase(r, p.Base.SHA, p.Head.SHA)
+	newSHA, err := rebase(r, p.Base.SHA, p.Head.SHA, out)
 	if err != nil {
 		return err
 	}
