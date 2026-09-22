@@ -16,18 +16,28 @@ gh auth login
 ## Use
 
 ```sh
-# Preview the rebase without pushing.
-gh-pr-rebase --dry-run https://github.com/OWNER/REPO/pull/123
+# In a GitHub checkout, use gh's repository detection.
+gh-pr-rebase --dry-run 123
+gh-pr-rebase 123
 
-# Rebase and push.
-gh-pr-rebase https://github.com/OWNER/REPO/pull/123
-# Or:
+# With no argument, use the current branch's PR (like gh pr view).
+gh-pr-rebase
+
+# Explicit targets also work outside a checkout.
+gh-pr-rebase --dry-run https://github.com/OWNER/REPO/pull/123
 gh-pr-rebase 'OWNER/REPO#123'
 ```
 
-Run from any directory. Put flags before the PR argument. `--host` (default:
-`GH_HOST`, or `github.com`) selects the host for shorthand arguments; a PR URL
-always selects its own host. GitHub Enterprise hosts are supported.
+Put flags before the PR argument. A number (also `'#123'`) or no argument is
+resolved by `gh pr view` in your current directory, using gh's remote/default
+repository selection, `GH_REPO`, and current-branch detection. If gh cannot
+identify a GitHub repository or PR, use an explicit URL or `OWNER/REPO#NUMBER`.
+Discovery reads your normal Git environment; the rebase itself remains isolated.
+
+For `OWNER/REPO#NUMBER`, `--host` defaults to `GH_HOST` or `github.com`. For an
+inferred PR, the host comes from gh's returned URL unless `--host` is explicitly
+set. An explicit PR URL always selects its own host. GitHub Enterprise hosts are
+supported.
 
 By default the authenticated user's profile name and GitHub noreply address are
 used as the committer identity. Authors are preserved. Override with
@@ -69,14 +79,18 @@ Use `--dry-run` first when you want to inspect the result before pushing.
   retry. The temporary repository is removed on exit; resolve complicated
   rebases manually. `--dry-run` actually performs the local rebase, but never
   pushes. Already-current branches are left untouched.
-- Rechecks PR state, edit permission, branch names, repositories, and commit
-  IDs before pushing. Push uses **an explicit expected-SHA force-with-lease**,
-  so a contributor's concurrent push is not overwritten.
+- Rebases onto the actual fetched base-branch tip, not the potentially stale
+  `base.sha` in GitHub's PR metadata. The fetched head must still match the PR's
+  head SHA; a mismatch aborts with both SHAs in the error.
+- Rechecks PR state, edit permission, branch names, repository identities, and
+  head SHA before pushing. Separately rechecks the actual remote base tip to
+  detect movement during the rebase. Push uses **an explicit expected-SHA
+  force-with-lease**, so a contributor's concurrent push is not overwritten.
 - GitHub does not offer a transaction spanning the base branch, PR metadata,
   and head push. The head SHA is protected atomically; the base or PR state can
   still change after the final API check. Re-run if the base advances again.
-- Hooks, global/system Git config, inherited `GIT_*` variables, submodules,
-  and commit signing are not used. No PR code is executed. Rewritten commits
+- During the rebase, hooks, global/system Git config, inherited `GIT_*`
+  variables, submodules, and commit signing are not used. No PR code is executed. Rewritten commits
   lose their signatures; branch protections requiring signed commits or
   forbidding force pushes can reject the push. Custom Git proxy/CA/config
   settings are not inherited.

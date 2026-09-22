@@ -37,6 +37,7 @@ type target struct{ Host, Repo, Number string }
 
 var repoPattern = regexp.MustCompile(`^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$`)
 var hostPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9.-]*$`)
+var numberPattern = regexp.MustCompile(`^#?[0-9]+$`)
 var shaPattern = regexp.MustCompile(`^[0-9a-f]{40}$`)
 
 func parseTarget(input, host string) (target, error) {
@@ -57,7 +58,7 @@ func parseTarget(input, host string) (target, error) {
 	} else {
 		repo, number, ok := strings.Cut(input, "#")
 		if !ok {
-			return t, errors.New("expected OWNER/REPO#NUMBER or a pull request URL")
+			return t, errors.New("expected NUMBER, OWNER/REPO#NUMBER, or a pull request URL")
 		}
 		t = target{host, repo, number}
 	}
@@ -66,6 +67,49 @@ func parseTarget(input, host string) (target, error) {
 		return target{}, errors.New("invalid host, repository, or pull request number")
 	}
 	t.Number = strconv.Itoa(n)
+	return t, nil
+}
+
+// Let gh resolve repository defaults, remotes, GH_REPO, and the current branch
+// before switching to the isolated environment used for the actual rebase.
+func resolveTarget(ctx context.Context, input, host string, hostExplicit bool) (target, error) {
+	if input != "" && !numberPattern.MatchString(input) {
+		return parseTarget(input, host)
+	}
+	args := []string{"pr", "view"}
+	if input != "" {
+		number, err := strconv.Atoi(strings.TrimPrefix(input, "#"))
+		if err != nil || number <= 0 {
+			return target{}, errors.New("invalid pull request number")
+		}
+		args = append(args, strconv.Itoa(number))
+	}
+	args = append(args, "--json", "url")
+	env := append(os.Environ(), "GH_PROMPT_DISABLED=1")
+	if hostExplicit {
+		env = append(env, "GH_HOST="+host)
+	}
+	discovery := runner{ctx: ctx, env: env}
+	data, err := discovery.command("gh", args...)
+	if err != nil {
+		return target{}, fmt.Errorf("cannot resolve pull request in the current GitHub repository (use a PR URL or OWNER/REPO#NUMBER to select it explicitly): %w", err)
+	}
+	var pr struct {
+		URL string `json:"url"`
+	}
+	if err := json.Unmarshal([]byte(data), &pr); err != nil {
+		return target{}, fmt.Errorf("invalid gh pr view response: %w", err)
+	}
+	t, err := parseTarget(pr.URL, host)
+	if err != nil {
+		return target{}, fmt.Errorf("invalid pull request URL from gh: %w", err)
+	}
+	if hostExplicit {
+		if !hostPattern.MatchString(host) {
+			return target{}, errors.New("invalid GitHub host")
+		}
+		t.Host = host
+	}
 	return t, nil
 }
 
@@ -124,8 +168,26 @@ func getPR(r runner, t target) (pullRequest, error) {
 	return p, p.validate()
 }
 func samePR(a, b pullRequest) bool {
-	return a.Head.Ref == b.Head.Ref && a.Head.SHA == b.Head.SHA && a.Head.Repo.FullName == b.Head.Repo.FullName && a.Base.Ref == b.Base.Ref && a.Base.SHA == b.Base.SHA && a.Base.Repo.FullName == b.Base.Repo.FullName
+	return a.Head.Ref == b.Head.Ref && a.Head.SHA == b.Head.SHA && a.Head.Repo.FullName == b.Head.Repo.FullName && a.Base.Ref == b.Base.Ref && a.Base.Repo.FullName == b.Base.Repo.FullName
 }
+
+// PR base.sha can be stale even when the base branch is not moving. The fetched
+// base is authoritative; compare it with the actual remote ref before pushing.
+func checkBaseTip(r runner, ref, expected string) error {
+	data, err := r.command("git", "ls-remote", "--exit-code", "base", "refs/heads/"+ref)
+	if err != nil {
+		return fmt.Errorf("cannot recheck base branch; nothing pushed: %w", err)
+	}
+	fields := strings.Fields(data)
+	if len(fields) != 2 || !shaPattern.MatchString(fields[0]) || fields[1] != "refs/heads/"+ref {
+		return errors.New("invalid base branch ref response; nothing pushed")
+	}
+	if fields[0] != expected {
+		return fmt.Errorf("base branch %s changed during rebase (fetched %s, now %s); nothing pushed; retry", ref, expected, fields[0])
+	}
+	return nil
+}
+
 func rebase(r runner, base, head string, out io.Writer) (string, error) {
 	if _, err := r.command("git", "checkout", "--detach", head); err != nil {
 		return "", err
@@ -206,22 +268,28 @@ func run(ctx context.Context, args []string, out io.Writer) error {
 	if defaultHost == "" {
 		defaultHost = "github.com"
 	}
-	host := fs.String("host", defaultHost, "GitHub host for OWNER/REPO#NUMBER (defaults to GH_HOST or github.com; URL host takes precedence)")
+	host := fs.String("host", defaultHost, "GitHub host (defaults to GH_HOST or github.com for OWNER/REPO#NUMBER; explicit URLs take precedence)")
 	dry := fs.Bool("dry-run", false, "perform the rebase locally without pushing")
 	name := fs.String("committer-name", "", "committer name (default: authenticated GitHub user's name)")
 	email := fs.String("committer-email", "", "committer email (default: authenticated GitHub user's noreply address)")
 	fs.Usage = func() {
-		fmt.Fprintln(out, "Usage: gh-pr-rebase [flags] https://github.com/OWNER/REPO/pull/NUMBER\n       gh-pr-rebase [flags] 'OWNER/REPO#NUMBER'\n\nRebases onto the current base branch and pushes with an explicit force-with-lease.\nRequires git and authenticated gh. Mergiraf is optional for conflicts. Flags must precede the PR.")
+		fmt.Fprintln(out, "Usage: gh-pr-rebase [flags] [NUMBER]\n       gh-pr-rebase [flags] https://github.com/OWNER/REPO/pull/NUMBER\n       gh-pr-rebase [flags] 'OWNER/REPO#NUMBER'\n\nA number uses gh's current repository; no argument uses the current branch's PR.\n\nRebases onto the current base branch and pushes with an explicit force-with-lease.\nRequires git and authenticated gh. Mergiraf is optional for conflicts. Flags must precede the PR.")
 		fs.PrintDefaults()
 	}
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	if fs.NArg() != 1 {
+	if fs.NArg() > 1 {
 		fs.Usage()
-		return errors.New("provide exactly one pull request")
+		return errors.New("provide at most one pull request")
 	}
-	t, err := parseTarget(fs.Arg(0), *host)
+	hostExplicit := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "host" {
+			hostExplicit = true
+		}
+	})
+	t, err := resolveTarget(ctx, fs.Arg(0), *host, hostExplicit)
 	if err != nil {
 		return err
 	}
@@ -282,6 +350,7 @@ func run(ctx context.Context, args []string, out io.Writer) error {
 			return err
 		}
 	}
+	var baseSHA string
 	for _, item := range []struct {
 		name string
 		b    branch
@@ -297,12 +366,14 @@ func run(ctx context.Context, args []string, out io.Writer) error {
 		if err != nil {
 			return err
 		}
-		if sha != item.b.SHA {
-			return errors.New("branch changed while fetching; retry")
+		if item.name == "base" {
+			baseSHA = sha
+		} else if sha != item.b.SHA {
+			return fmt.Errorf("head branch %s:%s does not match PR metadata (API %s, fetched %s); the PR may be stale or the head changed; nothing pushed; retry", item.b.Repo.FullName, item.b.Ref, item.b.SHA, sha)
 		}
 	}
 	fmt.Fprintf(out, "Rebasing %s:%s onto %s:%s…\n", p.Head.Repo.FullName, p.Head.Ref, p.Base.Repo.FullName, p.Base.Ref)
-	newSHA, err := rebase(r, p.Base.SHA, p.Head.SHA, out)
+	newSHA, err := rebase(r, baseSHA, p.Head.SHA, out)
 	if err != nil {
 		return err
 	}
@@ -320,6 +391,9 @@ func run(ctx context.Context, args []string, out io.Writer) error {
 	}
 	if !samePR(p, latest) {
 		return errors.New("pull request changed during rebase; nothing pushed; retry")
+	}
+	if err := checkBaseTip(r, p.Base.Ref, baseSHA); err != nil {
+		return err
 	}
 	if err := push(r, "head", p.Head.Ref, p.Head.SHA, newSHA); err != nil {
 		return err

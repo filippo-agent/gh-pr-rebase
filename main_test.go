@@ -330,7 +330,7 @@ func TestPushRejectsConcurrentUpdateWithExplicitLease(t *testing.T) {
 	}
 }
 
-func TestRunDryRunWithLocalRemote(t *testing.T) {
+func TestRunWithLocalRemote(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("uses POSIX test command wrappers")
 	}
@@ -382,7 +382,11 @@ func TestRunDryRunWithLocalRemote(t *testing.T) {
 if [ "$1" = "remote" ] && [ "$2" = "add" ]; then
   exec "$REAL_GIT" remote add "$3" "$TEST_REMOTE"
 fi
-if [ "$1" = "fetch" ]; then
+if [ "$1" = "ls-remote" ] && [ -n "$TEST_MOVED_BASE_SHA" ]; then
+  printf '%s\trefs/heads/main\n' "$TEST_MOVED_BASE_SHA"
+  exit 0
+fi
+if [ "$1" = "fetch" ] || [ "$1" = "ls-remote" ] || [ "$1" = "push" ]; then
   exec "$REAL_GIT" -c protocol.file.allow=always "$@"
 fi
 exec "$REAL_GIT" "$@"
@@ -402,17 +406,66 @@ esac
 	t.Setenv("TEST_USER_JSON", userFile)
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
 
-	var out bytes.Buffer
-	if err := run(context.Background(), []string{"--dry-run", "https://example.test/owner/repo/pull/1"}, &out); err != nil {
-		t.Fatalf("run() error = %v\noutput:\n%s", err, out.String())
+	for _, tc := range []struct {
+		name             string
+		apiBase, apiHead string
+		dry, moved       bool
+		wantError        string
+	}{
+		{name: "dry run", apiBase: base, apiHead: head, dry: true},
+		{name: "stale base metadata dry run", apiBase: initial, apiHead: head, dry: true},
+		{name: "changed head rejected", apiBase: initial, apiHead: initial, dry: true, wantError: "head branch owner/repo:feature does not match PR metadata"},
+		{name: "base movement before push rejected", apiBase: initial, apiHead: head, moved: true, wantError: "base branch main changed during rebase"},
+		{name: "stale base metadata push", apiBase: initial, apiHead: head},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pr.Base.SHA, pr.Head.SHA = tc.apiBase, tc.apiHead
+			data, err := json.Marshal(pr)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(prFile, data, 0o644); err != nil {
+				t.Fatal(err)
+			}
+			movedSHA := ""
+			if tc.moved {
+				movedSHA = initial
+			}
+			t.Setenv("TEST_MOVED_BASE_SHA", movedSHA)
+			args := []string{"https://example.test/owner/repo/pull/1"}
+			if tc.dry {
+				args = append([]string{"--dry-run"}, args...)
+			}
+			var out bytes.Buffer
+			err = run(context.Background(), args, &out)
+			if tc.wantError != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantError) {
+					t.Fatalf("run() error = %v, want %q", err, tc.wantError)
+				}
+			} else if err != nil {
+				t.Fatalf("run() error = %v\noutput:\n%s", err, out.String())
+			}
+			remoteHead := mustCommand(t, r, realGit, "--git-dir="+remote, "rev-parse", "refs/heads/feature")
+			if tc.dry || tc.wantError != "" {
+				if remoteHead != head {
+					t.Fatalf("unexpected push changed head from %s to %s", head, remoteHead)
+				}
+				if tc.dry && tc.wantError == "" && !strings.Contains(out.String(), "Dry run succeeded:") {
+					t.Fatalf("unexpected dry run output: %s", out.String())
+				}
+			} else {
+				if remoteHead == head {
+					t.Fatal("successful rebase did not push")
+				}
+				// Regression: must rebase onto the fetched tip, not stale PR base.sha.
+				mustCommand(t, r, realGit, "--git-dir="+remote, "merge-base", "--is-ancestor", base, remoteHead)
+				if content := mustCommand(t, r, realGit, "--git-dir="+remote, "show", remoteHead+":base"); content != "base" {
+					t.Fatalf("rebased tree lacks current base content: %q", content)
+				}
+			}
+		})
 	}
-	if got := out.String(); !strings.Contains(got, "Dry run succeeded:") || !strings.Contains(got, "nothing pushed") {
-		t.Fatalf("run() output = %q", got)
-	}
-	remoteHead := mustCommand(t, r, realGit, "--git-dir="+remote, "rev-parse", "refs/heads/feature")
-	if remoteHead != head {
-		t.Fatalf("dry run changed remote feature from %q to %q", head, remoteHead)
-	}
+
 }
 
 func writeExecutable(t *testing.T, path, contents string) {
